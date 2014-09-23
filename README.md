@@ -27,3 +27,26 @@
                             outdir/0/ outdir/1/ ... with outdir/authors file
       -v VERBOSE, --verbose VERBOSE
                             > 0 means more logging
+
+To create a series of collapsed 1-per-author git commits in a fresh
+repository by parsing `-o OUTDIR`:
+
+    cd your-git-repo-root
+    mkdir ../subset
+    find . -name '*.c' -o -name '*.h' > ../subset/srcs
+    gitcredit -o ../subset -f ../subset/srcs
+    cd ../subset
+    mkdir repo
+    cd repo
+    git init
+    while read -d ' ' commit; do
+      read author
+      cp -r ../$commit/. .
+      git add -A .
+      git commit -m "$author import" --author="$author"
+    done < ../authors
+    git tag initial HEAD
+    git log
+    git archive --format=tar.gz -o ../initial.tar.gz -v HEAD
+
+TODO: move the above shell commands into a python option `-r REPODIR`
