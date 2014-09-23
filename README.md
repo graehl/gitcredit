@@ -34,7 +34,8 @@ repository by parsing `-o OUTDIR`:
     find_srcs() {
         find "$@" -name '*.java' -o -name '*.py' -o -name '*.md' \
           -o -name '*.pl' -o -name '*.sh' -o -name '*.bat' \
-          -o -name '*.[chi]pp' -o -name '*.[ch]' -o -name '*.cc' -o -name '*.hh' -o -name '.gitignore'
+          -o -name '*.[chi]pp' -o -name '*.[ch]' -o -name '*.cc' -o -name '*.hh' \
+          -o -name '.gitignore'
     }
     gitsubset() {
         fullrepo=`pwd`
