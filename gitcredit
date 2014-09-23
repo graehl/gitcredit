@@ -1,0 +1,361 @@
+#!/usr/bin/python
+
+import sys, os, re, subprocess
+
+from itertools import imap
+
+def dict2str(d, pairsep=',', kvsep=':', omitv=None):
+    return pairsep.join('%s%s%s' % (k, kvsep, v) for k, v in d.iteritems() if omitv is None or v != omitv)
+
+def chomp(s):
+    return s.rstrip('\r\n')
+
+def chomped_lines(lines):
+    return imap(chomp, lines)  # python 2.x map returns a list, not a generator. imap returns a generator
+
+def is_terminal_fname(fname):
+    "return whether fname is '-' or '' or none - for stdin or stdout"
+    return (fname is None) or fname=='-' or fname==''
+
+import gzip
+
+def homepath(fname):
+    if fname.startswith('~') and 'HOME' in os.environ:
+        return os.environ['HOME'] + fname[1:]
+    else:
+        return fname
+
+def file_exists(fname):
+    return os.path.isfile(homepath(fname))
+
+def open_in(fname):
+    "if fname is '-', return sys.stdin, else return open(fname,'rb') (or if fname ends in .gz, gzip.open it)"
+    if is_terminal_fname(fname):
+        return sys.stdin
+    else:
+        return (gzip.open if fname.endswith('.gz') else open)(homepath(fname),'rb')
+
+def maybe_lines_in(fname):
+    if fname:
+        return map(chomp, open_in(fname))
+    else:
+        return []
+
+import errno
+
+def mkdir_p(path):
+    try:
+        os.makedirs(homepath(path))
+    except OSError as e:
+        pass
+        if getattr(e, 'errno') == errno.EEXIST:
+            pass
+        else: raise
+
+def mkdir_parent(file):
+    mkdir_p(os.path.dirname(file))
+
+def open_out(fname, append=False, mkdir=False):
+    """if fname is '-' or '' or none, return sys.stdout, else return open(fname,'w').
+      not sure if it's ok to close stdout, so let GC close file please."""
+    if is_terminal_fname(fname):
+        return sys.stdout
+    if mkdir:
+        mkdir_parent(fname)
+    return (gzip.open if fname.endswith('.gz') else open)(homepath(fname),'b'+'a' if append else 'w')
+
+def log(s, out=sys.stderr):
+    out.write("### %s\n" % s)
+
+def writeln(line, out=sys.stdout):
+    out.write(line)
+    out.write('\n')
+
+def removeprefix(str, prefix):
+    return (str[len(prefix):], True) if str.startswith(prefix) else (str, False)
+
+import argparse
+
+class hexint_action(argparse.Action):
+    'An argparse.Action that handles hex string input'
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, int(values, 0))
+    pass
+
+def addarg(argparser, shortname, typeclass, dest, help=None, action=None, *L, **M):
+    """helper for argparse (part of python 2.7, or you can install it)
+
+    example usage:
+
+args = argparse.ArgumentParser(description='generate lines using random words from dict file')
+
+addarg(args, '-d', str, 'dictionary', 'input words file', metavar='FILE')
+addarg(args, '-w', str, 'word', 'supplements the word list from input with the given word', nargs='*')
+
+args.set_defaults(dictionary='-')
+
+    """
+    longarg = '--' + dest.replace('_', '-')
+    shortl = [shortname] if shortname else []
+    L = shortl + [longarg] + list(L)
+    if action is None and typeclass == int:
+        action = hexint_action
+        typeclass = str
+    argparser.add_argument(*L, dest=dest, type=typeclass, help=help, action=action, **M)
+
+def addpositional(argparser, dest, help=None, nargs='*', option_strings=[], metavar='FILE', typeclass=str, **M):
+    argparser.add_argument(option_strings=option_strings, dest=dest, nargs=nargs, metavar=metavar, help=help, type=typeclass, **M)
+
+def addflag(argparser, shortname, dest, help=None, action='store_true', **M):
+    addarg(argparser, shortname, dest, action=action, **M)
+
+
+### end general graehl.py stuff
+
+import sys, os, re, subprocess, argparse
+
+def options():
+    parser = argparse.ArgumentParser(description='given a list of input paths inside the git repo your current dir is in, give credit according to `git blame`, optionally creating a fresh git repo without meaningful history but with a commit per author')
+    addarg(parser, '-f', str, 'filelist',
+           'file containing lines X to `git blame X` (from the current dir); - means STDIN - e.g. `find . > /tmp/filelist`')
+    addarg(parser, '-a', str, 'authormap',
+           'author mapping file - lines of e.g. gitauthorname = Normalized Author <user@example.com> - order is commit order for -o')
+    addarg(parser, '-b', str, 'blamearg',
+           '-argument passed to git blame e.g. for copy detection (which can be extremely slow) C CC or CCC')
+    addarg(parser, '-o', str, 'outdir',
+           'outdir (if set) used to store author revision subdirs outdir/0/ outdir/1/ ... with outdir/authors file')
+    addarg(parser, '-v', int, 'verbose',
+           '> 0 means more logging')
+    addpositional(parser, 'filename', '(args X for `git blame X`; added to --filelist file)')
+    parser.set_defaults(authormap='~/.git.authors', blamearg='', filelist='', filename=[], outdir='', verbose=0)
+    return parser
+
+global verbose
+verbose = 0
+
+def logverbose(v, *L, **M):
+    if verbose >= v:
+        log(*L, **M)
+
+class Contribution(object):
+    """ count number of lines over longlen nonspace chars long
+    """
+    def __init__(self, longlen=4):
+        self.longlen = longlen
+        self.lines = 0
+        self.nonspacelines = 0
+        self.longlines = 0
+        self.chars = 0
+        self.nonspacechars = 0
+    def count(self, line):
+        self.lines += 1
+        self.chars += len(line)
+        line = chomp(line)
+        chars = len(line) - line.count(' ') - line.count('\t') - line.count('\r') - line.count('\n')
+        if chars > 0:
+            self.nonspacechars += chars
+            self.nonspacelines += 1
+            if chars >= self.longlen:
+                self.longlines += 1
+    def add(self, o):
+        self.lines += o.lines
+        self.nonspacelines += o.nonspacelines
+        self.longlines += o.longlines
+        self.chars += o.chars
+        self.nonspacechars += o.nonspacechars
+
+    def __str__(self):
+        return '%s nonspace characters in %s lines with >= %s' % (self.nonspacechars, self.longlines, self.longlen)
+
+import collections
+
+class Contributions(collections.defaultdict):
+    def __init__(self, *a, **kw):
+        collections.defaultdict.__init__(self, Contribution, *a, **kw)
+    def __str__(self):
+        return '\n'.join(self.summary())
+    def summary(self, aorder=None, total=True):
+        if aorder is None:
+            aorder = sorted(keys(self))
+        s = []
+        totalc = Contribution()
+        for a in aorder:
+            if a in self:
+                c = self[a]
+                totalc.add(c)
+                s.append('%s\t%s' % (a, c))
+        if total:
+            s.append('%s\t%s' % ('TOTAL', totalc))
+
+        return s
+
+def selectlines(lineseq, seq):
+    return
+
+def subprocess_output(args, shell=False, cwd=None, bufsize=0, logerr=True, keepnl=False):
+    proc = subprocess.Popen(args, cwd=cwd, shell=shell, stdout=subprocess.PIPE, bufsize=bufsize)
+    (output, err) = proc.communicate()
+    if logerr and err:
+        log('%s STDERR:\n%s' % err)
+    if proc.returncode != 0:
+        raise SystemExit('%s EXIT CODE: %s' % (args, proc.returncode))
+    if isinstance(output, str):
+        return output.splitlines(keepnl)
+    else:
+        return map(chomp, output)
+
+def gitblame(authorships, justfile=None, blameargs=[], contributions=None, repodir='.', gitpaths=None):
+    """
+    record contributions, a Contributions() map
+
+    optionally record gitpaths, a set
+
+    if filename not set git blame runs on all files
+
+    return
+    """
+    args = ['git', 'blame', '--line-porcelain']
+    if blameargs:
+        log(blameargs)
+        args.extend(blameargs)
+    if justfile:
+        args.append(justfile)
+    logverbose(3, 'running: %s' % args)
+    proc = subprocess.Popen(args, cwd=repodir, stdout=subprocess.PIPE, bufsize=0, shell=False)
+    authorpre = 'author '
+    filenamepre = 'filename '
+    contentpre = '\t'
+    lineseq = [] # (line, autorship-sequence)
+    seqauthor = {}
+    gitpath = None
+    lastgitpath = None
+    def finishfile(gitpath):
+        if gitpath is not None and authorships.outdir:
+            for seq, author in seqauthor.items():
+                logverbose(1, '%s %s %s' % (gitpath, seq, author))
+                with authorships.writeseq(author, gitpath) as out:
+                    for line, s in lineseq:
+                        out.write(line if s <= seq else '\n')
+        seqauthor.clear()
+        del lineseq[:]
+    for p in iter(proc.stdout.readline, b''):
+        if p.startswith(authorpre):
+            author = chomp(p[len(authorpre):])
+        elif p.startswith(filenamepre):
+            gitpath = chomp(p[len(filenamepre):])
+        elif p.startswith(contentpre):
+            content = p[len(contentpre):]
+            assert author is not None
+            assert gitpath is not None
+            if gitpath != lastgitpath:
+                finishfile(lastgitpath)
+                lastgitpath = gitpath
+                gitpaths.add(gitpath)
+            logverbose(2, '%s\t%s\t%s' % (gitpath, author, chomp(content)))
+            author, seq = authorships.authorseq(author)
+            seqauthor[seq] = author
+            if contributions is not None:
+               contributions[author].count(content)
+            lineseq.append((content, seq))
+    finishfile(lastgitpath)
+    (output, err) = proc.communicate()
+    if proc.returncode != 0:
+        log('ERROR: %s' % args)
+
+def commitmsg(author):
+    return '%s initial commit' % author
+
+def authormap(amapfile):
+    amap = {}
+    authors = set()
+    aorder = []
+    if amapfile:
+        if not file_exists(amapfile):
+            log("--authormap file %s not found" % amapfile)
+        else:
+            for line in chomped_lines(open_in(amapfile)):
+                mapping = line.split(' = ')
+                if len(mapping) == 2:
+                    name, repl = mapping
+                    if repl not in authors:
+                        authors.add(repl)
+                        aorder.append(repl)
+                    if name not in amap:
+                        log('mapping author name "%s" => "%s"' % (name, repl))
+                        amap[name] = repl
+                    else:
+                        log('duplicate authorsmap author: %s' % name)
+                else:
+                    log("bad author-map line: '%s' - should be 'in = out'" % line)
+    return amap, aorder
+
+class Authorships(object):
+    def __init__(self, amapfile, outdir=None, frozen=False):
+        self.outdir = outdir
+        if self.outdir:
+            self.authorsfilename = os.path.join(self.outdir, 'authors')
+            self.authorsfile = open_out(self.authorsfilename, mkdir=True)
+        self.amap, self.aorder = authormap(amapfile)
+        self.aseq = {}
+        for i, author in enumerate(self.aorder):
+            self.setseq(i, author)
+        self.frozen = frozen
+        self.madedirs = set()
+    def makedir(self, d):
+        if d not in self.madedirs:
+            mkdir_p(d)
+            self.madedirs.add(d)
+        return d
+    def seq(self, author):
+        return self.authorseq(author)[1]
+    def setseq(self, seq, author):
+        self.aseq[author] = seq
+        if self.outdir:
+            self.authorsfile.write('%d %s\n' % (seq, author))
+    def authorseq(self, author):
+        if author in self.amap:
+            author = self.amap[author]
+        elif self.frozen:
+            raise SystemExit("%s not in author map" % author)
+        if author not in self.aseq:
+            self.setseq(len(self.aorder), author)
+            self.aorder.append(author)
+        return author, self.aseq[author]
+    def seqdir(self, author, subdir):
+        return self.makedir(os.path.join(self.outdir, str(self.seq(author)), subdir))
+    def writeseq(self, author, subpath):
+        subdir, basename = os.path.split(subpath)
+        return open(os.path.join(self.seqdir(author, subdir), basename), 'wb')
+
+def ensureprefix(str, pre):
+    return str if str.startswith(pre) else pre + str
+
+def gitcredit(opt):
+    files = maybe_lines_in(opt.filelist)
+    files.extend(opt.filename)
+    authorships = Authorships(opt.authormap, opt.outdir)
+    contributions = Contributions()
+    blameargs = ['-w', '-M']
+    if opt.blamearg:
+        blameargs.append(ensureprefix(opt.blamearg, '-'))
+    if len(files) == 0:
+        files = chomped_lines(subprocess_output(['git', 'ls-files']))
+    gitpaths = set()
+    for file in files:
+        log('gitcredit %s' % file)
+        gitblame(authorships, file, blameargs, contributions=contributions, gitpaths=gitpaths)
+    if opt.outdir:
+        with open_out(os.path.join(opt.outdir, 'files')) as out:
+            for path in gitpaths:
+                out.write(path + '\n')
+    for path in gitpaths:
+        log(path)
+    print '\n'.join(contributions.summary(authorships.aorder))
+
+if __name__ == '__main__':
+    try:
+        opt = options().parse_args()
+        verbose = opt.verbose
+        gitcredit(opt)
+    except KeyboardInterrupt:
+        log("^C user interrupt")
